@@ -8,7 +8,7 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 import requests
 
 # --------------------------
-# Optional SBOM normalization (if your loader is available)
+# Optional SBOM normalization
 # --------------------------
 def try_import_sbom_loader():
     try:
@@ -260,6 +260,8 @@ def main():
     parser.add_argument("--json", default="final_report.json", help="JSON report output path")
     parser.add_argument("--csv", nargs="?", const="final_report.csv", help="CSV report output path")
     parser.add_argument("--normalize", action="store_true", help="Normalize SBOM via SBOMLoader if available")
+    parser.add_argument("--top", type=int, default=0,
+                        help="Print top N vulnerabilities by prioritization score to stdout (quick triage)")
     args = parser.parse_args()
 
     sbom_path = args.sbom
@@ -324,6 +326,14 @@ def main():
         x["cvss"] if x["cvss"] is not None else -1,
         x["epss"] if x["epss"] is not None else -1,
     ), reverse=True)
+
+    # Quick triage printout
+    if args.top and results:
+        print(f"\n🔍 Top {args.top} vulnerabilities by prioritization score:")
+        for i, r in enumerate(results[:args.top], start=1):
+            print(f"{i}. {r['package']}@{r['version']} | ID: {r['id']} | "
+                  f"CVSS: {r.get('cvss')} | EPSS: {r.get('epss')} | "
+                  f"Score: {r.get('score')} | Summary: {r.get('summary')[:80]}{'...' if len(r.get('summary',''))>80 else ''}")
 
     status = "ok" if results else "empty"
     message = f"Found {len(results)} vulnerabilities" if results else "No vulnerabilities found in the scanned SBOM."
