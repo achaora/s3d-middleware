@@ -3,11 +3,15 @@ import argparse
 import csv
 import json
 import subprocess
+import time
 from datetime import datetime, timezone, timedelta
 from typing import Any, Dict, Iterable, List, Optional, Tuple, Union
+
 import requests
 
-# Optional SBOMLoader
+# --------------------------
+# Optional SBOM normalization
+# --------------------------
 def try_import_sbom_loader():
     try:
         from sbom_loader import SBOMLoader  # type: ignore
@@ -15,9 +19,9 @@ def try_import_sbom_loader():
     except Exception:
         return None
 
-# -----------------------
+# --------------------------
 # Time / misc helpers
-# -----------------------
+# --------------------------
 def utc_minus_4_iso() -> str:
     tz = timezone(timedelta(hours=-4))
     return datetime.now(tz).replace(microsecond=0).isoformat()
@@ -32,9 +36,9 @@ def get_osv_version() -> str:
     except Exception:
         return "unknown"
 
-# -----------------------
+# --------------------------
 # OSV scan
-# -----------------------
+# --------------------------
 def run_osv_scan(sbom_path: str, output_path: str) -> Tuple[int, str, str]:
     proc = subprocess.run(
         ["osv-scanner", "scan", "--sbom", sbom_path, "--format", "json", "--output", output_path],
@@ -42,9 +46,9 @@ def run_osv_scan(sbom_path: str, output_path: str) -> Tuple[int, str, str]:
     )
     return proc.returncode, proc.stdout or "", proc.stderr or ""
 
-# -----------------------
-# Unwrap SBOM if needed
-# -----------------------
+# --------------------------
+# Unwrap "sbom" key if present
+# --------------------------
 def unwrap_sbom_if_needed(sbom_path: str) -> str:
     with open(sbom_path) as f:
         data = json.load(f)
@@ -57,28 +61,20 @@ def unwrap_sbom_if_needed(sbom_path: str) -> str:
         return temp_path
     return sbom_path
 
-# -----------------------
+# --------------------------
 # CVSS helpers
-# -----------------------
-_SEVERITY_MAP = {
-    "CRITICAL": 9.5,
-    "HIGH": 7.5,
-    "MEDIUM": 5.0,
-    "LOW": 3.1,
-}
+# --------------------------
+_SEVERITY_MAP = {"CRITICAL": 9.5, "HIGH": 7.5, "MEDIUM": 5.0, "LOW": 3.1}
 
 def _try_float(x: Any) -> Optional[float]:
-    try:
-        return float(x)
-    except Exception:
-        return None
+    try: return float(x)
+    except Exception: return None
 
 def _extract_cvss_from_groups(groups: List[Dict[str, Any]]) -> Optional[float]:
     best = None
     for g in groups or []:
         v = _try_float(g.get("max_severity"))
-        if v is not None:
-            best = v if best is None else max(best, v)
+        if v is not None: best = v if best is None else max(best, v)
     return best
 
 def _extract_cvss_from_severity_entries(entries: List[Dict[str, Any]]) -> Optional[float]:
@@ -86,45 +82,36 @@ def _extract_cvss_from_severity_entries(entries: List[Dict[str, Any]]) -> Option
     for ent in entries or []:
         score = ent.get("score")
         f = _try_float(score)
-        if f is not None:
-            best = f if best is None else max(best, f)
+        if f is not None: best = f if best is None else max(best, f)
     return best
 
 def _extract_cvss_from_database_specific(db_spec: Dict[str, Any]) -> Optional[float]:
     sev = (db_spec or {}).get("severity")
     if isinstance(sev, str):
-        sev_up = sev.strip().upper()
-        return _SEVERITY_MAP.get(sev_up)
+        return _SEVERITY_MAP.get(sev.strip().upper())
     return None
 
 def extract_cvss_base(vuln: Dict[str, Any], pkg_groups: List[Dict[str, Any]]) -> Optional[float]:
     cvss = _extract_cvss_from_groups(pkg_groups)
-    if cvss is not None:
-        return cvss
+    if cvss is not None: return cvss
     cvss = _extract_cvss_from_severity_entries(vuln.get("severity", []))
-    if cvss is not None:
-        return cvss
-    cvss = _extract_cvss_from_database_specific(vuln.get("database_specific", {}))
-    return cvss
+    if cvss is not None: return cvss
+    return _extract_cvss_from_database_specific(vuln.get("database_specific", {}))
 
-# -----------------------
+# --------------------------
 # EPSS helpers
-# -----------------------
+# --------------------------
 def chunk_by_char_limit(items: Iterable[str], max_chars: int = 1800) -> Iterable[List[str]]:
     batch: List[str] = []
     size = 0
     for cve in items:
         add = len(cve) + (1 if batch else 0)
         if size + add > max_chars:
-            if batch:
-                yield batch
-            batch = [cve]
-            size = len(cve)
+            if batch: yield batch
+            batch = [cve]; size = len(cve)
         else:
-            batch.append(cve)
-            size += add
-    if batch:
-        yield batch
+            batch.append(cve); size += add
+    if batch: yield batch
 
 def query_epss(cve_ids: Iterable[str], timeout: int = 30) -> Dict[str, Dict[str, Any]]:
     epss_map: Dict[str, Dict[str, Any]] = {}
@@ -144,39 +131,35 @@ def query_epss(cve_ids: Iterable[str], timeout: int = 30) -> Dict[str, Dict[str,
                         "percentile": _try_float(row.get("percentile")) or 0.0,
                         "date": row.get("date"),
                     }
-        except Exception:
-            continue
+        except Exception: continue
     return epss_map
 
-# -----------------------
+# --------------------------
 # Prioritization
-# -----------------------
+# --------------------------
 def compute_prioritization(cvss: Optional[float], epss: Optional[float], s3d: Optional[float],
-                           cvss_w: float, epss_w: float, s3d_w: float) -> float:
-    # Normalize weights
-    total = cvss_w + epss_w + s3d_w
-    cvss_w, epss_w, s3d_w = cvss_w / total, epss_w / total, s3d_w / total
-    cv = (cvss or 0.0) / 10.0
-    ep = epss or 0.0
-    s = s3d or 0.0
-    return round(cv * cvss_w + ep * epss_w + s * s3d_w, 4)
+                           cvss_weight: float, epss_weight: float, s3d_weight: float) -> Optional[float]:
+    total = cvss_weight + epss_weight + s3d_weight
+    if total == 0: return None
+    cvss_norm = (cvss or 0.0) * cvss_weight / total
+    epss_norm = (epss or 0.0) * epss_weight / total
+    s3d_norm = (s3d or 0.0) * s3d_weight / total
+    return round(cvss_norm + epss_norm + s3d_norm, 4)
 
 def prioritization_product(cvss: Optional[float], epss: Optional[float]) -> Optional[float]:
-    if cvss is None or epss is None:
-        return None
+    if cvss is None or epss is None: return None
     return round((cvss / 10.0) * epss, 4)
 
-# -----------------------
+# --------------------------
 # Parse OSV results
-# -----------------------
+# --------------------------
 def _extract_fixed_versions(vuln: Dict[str, Any]) -> List[str]:
     fixed = set()
     for aff in vuln.get("affected", []):
         for r in aff.get("ranges", []):
             for ev in r.get("events", []):
                 fx = ev.get("fixed")
-                if fx:
-                    fixed.add(fx)
+                if fx: fixed.add(fx)
     return sorted(fixed)
 
 def parse_osv_results(osv_json: Dict[str, Any]) -> Tuple[List[Dict[str, Any]], List[str]]:
@@ -194,10 +177,8 @@ def parse_osv_results(osv_json: Dict[str, Any]) -> Tuple[List[Dict[str, Any]], L
             for v in pkg.get("vulnerabilities", []):
                 vid = v.get("id", "")
                 aliases = v.get("aliases", []) or []
-
                 candidate_cves: List[str] = []
-                if vid.startswith("CVE-"):
-                    candidate_cves.append(vid)
+                if vid.startswith("CVE-"): candidate_cves.append(vid)
                 candidate_cves += [a for a in aliases if isinstance(a, str) and a.startswith("CVE-")]
                 cve_ids.extend(candidate_cves)
 
@@ -214,132 +195,112 @@ def parse_osv_results(osv_json: Dict[str, Any]) -> Tuple[List[Dict[str, Any]], L
                     "cvss": cvss,
                     "epss": None,
                     "epss_percentile": None,
-                    "s3d": 0.0,
+                    "s3d": None,
+                    "s3d_percentile": None,
                     "score_weighted": None,
                     "score_alt": None,
                     "fixed": _extract_fixed_versions(v),
                 })
-
     return final_results, sorted(set(cve_ids))
 
-# -----------------------
-# S3D Model 2 fetch
-# -----------------------
-def fetch_s3d_model2_metrics(deps: List[Dict[str, Any]]) -> Dict[str, Dict[str, float]]:
-    # Lazy import for FastAPI client
-    from google.cloud import bigquery
-    client = bigquery.Client()
-    metrics: Dict[str, Dict[str, float]] = {}
-    names = [d["package"] for d in deps]
-    versions = [d["version"] for d in deps]
-
-    # Query latest per name+version
-    query = """
-        WITH params AS (
-            SELECT name, version
-            FROM UNNEST(@names) AS name WITH OFFSET
-            JOIN UNNEST(@versions) AS version WITH OFFSET USING(OFFSET)
-        ),
-        ranked AS (
-            SELECT
-                t.dependency_name,
-                t.dependency_version,
-                relative_distribution_name AS relative_distribution,
-                percentile_rank_name AS percentile_rank,
-                relative_distribution_version AS relative_distribution_version,
-                percentile_rank_version AS percentile_rank_version,
-                run_date,
-                ROW_NUMBER() OVER (
-                    PARTITION BY t.dependency_name, t.dependency_version
-                    ORDER BY run_date DESC
-                ) AS rn
-            FROM `s3d_dura_data.s3d_model_2` t
-            JOIN params p
-            ON t.dependency_name = p.name AND t.dependency_version = p.version
-        )
-        SELECT *
-        FROM ranked
-        WHERE rn = 1
-    """
-    job = client.query(
-        query,
-        job_config=bigquery.QueryJobConfig(
-            query_parameters=[
-                bigquery.ArrayQueryParameter("names", "STRING", names),
-                bigquery.ArrayQueryParameter("versions", "STRING", versions)
-            ]
-        ),
-    )
-    for row in job:
-        key = f"{row['dependency_name']}@{row['dependency_version']}"
-        metrics[key] = {
-            "s3d": row.get("relative_distribution_version") or 0.0,
-            "s3d_percentile": row.get("percentile_rank_version") or 0.0
-        }
-    return metrics
-
-# -----------------------
-# Save reports
-# -----------------------
+# --------------------------
+# Reporting
+# --------------------------
 def save_json_report(path: str, report: Dict[str, Any]) -> None:
-    with open(path, "w") as f:
-        json.dump(report, f, indent=2)
+    with open(path, "w") as f: json.dump(report, f, indent=2)
 
 def save_csv(results: List[Dict[str, Any]], path: str) -> None:
-    fieldnames = [
-        "package", "version", "ecosystem", "id", "aliases", "cves",
-        "summary", "cvss", "epss", "epss_percentile", "s3d", "score_weighted", "score_alt", "fixed"
-    ]
-    with open(path, "w", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=fieldnames)
+    fieldnames = ["package","version","ecosystem","id","cves","summary",
+                  "cvss","epss","epss_percentile","s3d","s3d_percentile",
+                  "score_weighted","score_alt","fixed"]
+    with open(path,"w",newline="") as f:
+        writer = csv.DictWriter(f,fieldnames=fieldnames)
         writer.writeheader()
         for r in results:
             writer.writerow({
-                "package": r.get("package", ""),
-                "version": r.get("version", ""),
-                "ecosystem": r.get("ecosystem", ""),
-                "id": r.get("id", ""),
-                "aliases": ",".join(r.get("aliases", [])),
-                "cves": ",".join(r.get("cves", [])),
-                "summary": r.get("summary", ""),
+                "package": r.get("package",""),
+                "version": r.get("version",""),
+                "ecosystem": r.get("ecosystem",""),
+                "id": r.get("id",""),
+                "cves": ",".join(r.get("cves",[])),
+                "summary": r.get("summary",""),
                 "cvss": r.get("cvss"),
                 "epss": r.get("epss"),
                 "epss_percentile": r.get("epss_percentile"),
                 "s3d": r.get("s3d"),
+                "s3d_percentile": r.get("s3d_percentile"),
                 "score_weighted": r.get("score_weighted"),
                 "score_alt": r.get("score_alt"),
-                "fixed": ",".join(r.get("fixed", [])),
+                "fixed": ",".join(r.get("fixed",[])),
             })
 
-# -----------------------
+# --------------------------
+# S3D API fetch with retry
+# --------------------------
+def fetch_s3d_metrics_api(
+    deps: List[Dict[str, Any]],
+    api_url: str = "https://s3d-models-api-973562431566.us-east5.run.app/s3d_model_2/metrics",
+    max_retries: int = 3,
+    backoff: float = 2.0
+) -> Dict[str, Dict[str, float]]:
+    metrics: Dict[str, Dict[str, float]] = {}
+    if not deps: return metrics
+    names = [d["package"] for d in deps]
+    versions = [d["version"] for d in deps]
+    payload = {"dependency_names": names, "dependency_versions": versions}
+    attempt = 0
+    while attempt < max_retries:
+        try:
+            r = requests.get(api_url, params=payload, timeout=30)
+            r.raise_for_status()
+            data = r.json()
+            for entry in data:
+                key = f"{entry['dependency_name']}@{entry.get('dependency_version') or ''}"
+                metrics[key] = {
+                    "s3d": entry.get("relative_distribution_version") or 0.0,
+                    "s3d_percentile": entry.get("percentile_rank_version") or 0.0
+                }
+            return metrics
+        except requests.RequestException as e:
+            attempt += 1
+            wait_time = backoff ** attempt
+            print(f"⚠️ Attempt {attempt}/{max_retries} failed for S3D API: {e}. Retrying in {wait_time:.1f}s...")
+            time.sleep(wait_time)
+        except ValueError as e:
+            print(f"⚠️ Invalid JSON from S3D API: {e}. Returning empty metrics.")
+            return metrics
+    print("⚠️ Failed to fetch S3D metrics after retries. Returning empty metrics.")
+    return metrics
+
+# --------------------------
 # Main
-# -----------------------
+# --------------------------
 def main():
-    parser = argparse.ArgumentParser(description="S3D Vulnerability Scanner with OSV + EPSS + S3D")
-    parser.add_argument("--sbom", required=True, help="Path to SPDX JSON SBOM")
+    parser = argparse.ArgumentParser(description="Scan SPDX SBOM with OSV + EPSS + S3D metrics, export JSON/CSV")
+    parser.add_argument("--sbom", required=True, help="Path to SPDX JSON SBOM (e.g., *.spdx.json)")
     parser.add_argument("--json", default="final_report.json", help="JSON report output path")
     parser.add_argument("--csv", nargs="?", const="final_report.csv", help="CSV report output path")
     parser.add_argument("--normalize", action="store_true", help="Normalize SBOM via SBOMLoader if available")
-    parser.add_argument("--top", type=int, default=0, help="Print top N vulnerabilities for quick triage")
-    parser.add_argument("--cvss-weight", type=float, default=0.75, help="Weight for CVSS (default=0.75)")
-    parser.add_argument("--epss-weight", type=float, default=0.25, help="Weight for EPSS (default=0.25)")
-    parser.add_argument("--s3d-weight", type=float, default=0.0, help="Weight for S3D (default=0.0)")
+    parser.add_argument("--top", type=int, default=0, help="Print top N vulnerabilities by weighted score")
+    parser.add_argument("--cvss-weight", type=float, default=0.75, help="Weight for CVSS in weighted score")
+    parser.add_argument("--epss-weight", type=float, default=0.25, help="Weight for EPSS in weighted score")
+    parser.add_argument("--s3d-weight", type=float, default=0.0, help="Weight for S3D metric in weighted score")
+    parser.add_argument("--s3d-api", default="https://s3d-models-api-973562431566.us-east5.run.app/s3d_model_2/metrics", help="S3D API URL")
     args = parser.parse_args()
 
     sbom_path = args.sbom
 
-    # Optional SBOM normalization
+    # Optional normalization
     if args.normalize:
         SBOMLoader = try_import_sbom_loader()
         if SBOMLoader:
             loader = SBOMLoader(sbom_path).load()
             sbom_dict = loader.get_data()
             sbom_path = "sbom_clean.spdx.json"
-            with open(sbom_path, "w") as f:
-                json.dump(sbom_dict, f, indent=2)
-            print(f"ℹ️  SBOM normalized to {sbom_path}")
+            with open(sbom_path, "w") as f: json.dump(sbom_dict, f, indent=2)
+            print(f"ℹ️ SBOM normalized to {sbom_path}")
 
-    # Automatic unwrap
+    # Automatic unwrap "sbom" key if present
     sbom_path = unwrap_sbom_if_needed(sbom_path)
 
     osv_results_path = "osv_results.json"
@@ -351,18 +312,13 @@ def main():
             "sbom_file": args.sbom,
             "sbom_used": sbom_path,
             "osv_scanner_version": get_osv_version(),
-            "details": {
-                "message": "osv-scanner failed to execute",
-                "returncode": code,
-                "stdout": so.splitlines()[-20:],
-                "stderr": se.splitlines()[-20:]
-            },
+            "details": {"message": "osv-scanner failed", "returncode": code, "stdout": so, "stderr": se},
             "results": []
         }
         save_json_report(args.json, report)
-        print("❌ osv-scanner execution failed; see JSON report for details.")
+        print("❌ osv-scanner failed; see JSON report.")
         return
-    print(f"✅ osv-scanner completed (exit code {code}).")
+    print(f"✅ osv-scanner completed (exit code {code})")
 
     with open(osv_results_path) as f:
         osv_json = json.load(f)
@@ -376,53 +332,63 @@ def main():
         if primary_cve and primary_cve in epss_map:
             r["epss"] = epss_map[primary_cve]["epss"]
             r["epss_percentile"] = epss_map[primary_cve]["percentile"]
+        else:
+            r["epss"] = None
+            r["epss_percentile"] = None
 
-    # S3D Model 2 integration
-    s3d_metrics = fetch_s3d_model2_metrics(results)
+    # S3D metrics
+    s3d_map = fetch_s3d_metrics_api(results, api_url=args.s3d_api)
     for r in results:
-        key = f"{r['package']}@{r['version']}"
-        r["s3d"] = s3d_metrics.get(key, {}).get("s3d", 0.0)
+        key = f"{r['package']}@{r['version'] or ''}"
+        if key in s3d_map:
+            r["s3d"] = s3d_map[key]["s3d"]
+            r["s3d_percentile"] = s3d_map[key]["s3d_percentile"]
+        else:
+            r["s3d"] = 0.0
+            r["s3d_percentile"] = 0.0
 
-        # Weighted prioritization
+        # Compute weighted score
         r["score_weighted"] = compute_prioritization(
-            r.get("cvss"), r.get("epss"), r.get("s3d"),
-            args.cvss_weight, args.epss_weight, args.s3d_weight
+            r.get("cvss"),
+            r.get("epss"),
+            r.get("s3d"),
+            args.cvss_weight,
+            args.epss_weight,
+            args.s3d_weight
         )
         r["score_alt"] = prioritization_product(r.get("cvss"), r.get("epss"))
 
-    results.sort(key=lambda x: (
-        x["score_weighted"] if x["score_weighted"] is not None else -1,
-        x["cvss"] if x["cvss"] is not None else -1,
-        x["epss"] if x["epss"] is not None else -1,
-    ), reverse=True)
+    # Sort results by weighted score
+    results.sort(key=lambda x: (x["score_weighted"] or -1, x["cvss"] or -1, x["epss"] or -1), reverse=True)
 
-    # Quick triage
+    # Quick triage printout
     if args.top and results:
         print(f"\n🔍 Top {args.top} vulnerabilities by weighted score:")
         for i, r in enumerate(results[:args.top], start=1):
             print(f"{i}. {r['package']}@{r['version']} | ID: {r['id']} | "
-                  f"CVSS: {r.get('cvss')} | EPSS: {r.get('epss')} | "
-                  f"S3D: {r.get('s3d')} | Score: {r.get('score_weighted')} | "
-                  f"Summary: {r.get('summary')[:80]}{'...' if len(r.get('summary',''))>80 else ''}")
+                  f"CVSS: {r.get('cvss')} | EPSS: {r.get('epss')} | S3D: {r.get('s3d')} | "
+                  f"Score: {r.get('score_weighted')} | Summary: {r.get('summary')[:80]}{'...' if len(r.get('summary',''))>80 else ''}")
 
-    # Save reports
+    status = "ok" if results else "empty"
+    message = f"Found {len(results)} vulnerabilities" if results else "No vulnerabilities found."
+
     report = {
-        "status": "ok" if results else "empty",
+        "status": status,
         "timestamp": utc_minus_4_iso(),
         "sbom_file": args.sbom,
         "sbom_used": sbom_path,
         "osv_scanner_version": get_osv_version(),
-        "details": {"message": f"Found {len(results)} vulnerabilities" if results else "No vulnerabilities found",
-                    "unique_cves": len(cve_ids)},
+        "details": {"message": message, "unique_cves": len(cve_ids)},
         "results": results
     }
+
     save_json_report(args.json, report)
     if args.csv:
         csv_path = args.csv if isinstance(args.csv, str) else "final_report.csv"
         save_csv(results, csv_path)
-        print(f"🧾 CSV saved to {csv_path}")
-    print(f"📄 JSON saved to {args.json}")
 
+    print(f"📄 JSON saved to {args.json}")
+    if args.csv: print(f"🧾 CSV saved to {csv_path}")
 
 if __name__ == "__main__":
     main()
