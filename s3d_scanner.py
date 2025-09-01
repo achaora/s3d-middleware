@@ -4,12 +4,10 @@ import csv
 import json
 import subprocess
 from datetime import datetime, timezone, timedelta
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Tuple, Union
 import requests
 
-# --------------------------
-# Optional SBOM normalization
-# --------------------------
+# Optional SBOMLoader
 def try_import_sbom_loader():
     try:
         from sbom_loader import SBOMLoader  # type: ignore
@@ -17,9 +15,9 @@ def try_import_sbom_loader():
     except Exception:
         return None
 
-# --------------------------
+# -----------------------
 # Time / misc helpers
-# --------------------------
+# -----------------------
 def utc_minus_4_iso() -> str:
     tz = timezone(timedelta(hours=-4))
     return datetime.now(tz).replace(microsecond=0).isoformat()
@@ -34,9 +32,9 @@ def get_osv_version() -> str:
     except Exception:
         return "unknown"
 
-# --------------------------
+# -----------------------
 # OSV scan
-# --------------------------
+# -----------------------
 def run_osv_scan(sbom_path: str, output_path: str) -> Tuple[int, str, str]:
     proc = subprocess.run(
         ["osv-scanner", "scan", "--sbom", sbom_path, "--format", "json", "--output", output_path],
@@ -44,9 +42,9 @@ def run_osv_scan(sbom_path: str, output_path: str) -> Tuple[int, str, str]:
     )
     return proc.returncode, proc.stdout or "", proc.stderr or ""
 
-# --------------------------
-# Unwrap "sbom" key if present
-# --------------------------
+# -----------------------
+# Unwrap SBOM if needed
+# -----------------------
 def unwrap_sbom_if_needed(sbom_path: str) -> str:
     with open(sbom_path) as f:
         data = json.load(f)
@@ -59,9 +57,9 @@ def unwrap_sbom_if_needed(sbom_path: str) -> str:
         return temp_path
     return sbom_path
 
-# --------------------------
+# -----------------------
 # CVSS helpers
-# --------------------------
+# -----------------------
 _SEVERITY_MAP = {
     "CRITICAL": 9.5,
     "HIGH": 7.5,
@@ -109,9 +107,9 @@ def extract_cvss_base(vuln: Dict[str, Any], pkg_groups: List[Dict[str, Any]]) ->
     cvss = _extract_cvss_from_database_specific(vuln.get("database_specific", {}))
     return cvss
 
-# --------------------------
+# -----------------------
 # EPSS helpers
-# --------------------------
+# -----------------------
 def chunk_by_char_limit(items: Iterable[str], max_chars: int = 1800) -> Iterable[List[str]]:
     batch: List[str] = []
     size = 0
@@ -150,24 +148,27 @@ def query_epss(cve_ids: Iterable[str], timeout: int = 30) -> Dict[str, Dict[str,
             continue
     return epss_map
 
-# --------------------------
+# -----------------------
 # Prioritization
-# --------------------------
-def prioritization_score(cvss: Optional[float], epss: Optional[float]) -> Optional[float]:
-    if cvss is None and epss is None:
-        return None
+# -----------------------
+def compute_prioritization(cvss: Optional[float], epss: Optional[float], s3d: Optional[float],
+                           cvss_w: float, epss_w: float, s3d_w: float) -> float:
+    # Normalize weights
+    total = cvss_w + epss_w + s3d_w
+    cvss_w, epss_w, s3d_w = cvss_w / total, epss_w / total, s3d_w / total
     cv = (cvss or 0.0) / 10.0
     ep = epss or 0.0
-    return round(cv * 0.6 + ep * 0.4, 4)
+    s = s3d or 0.0
+    return round(cv * cvss_w + ep * epss_w + s * s3d_w, 4)
 
 def prioritization_product(cvss: Optional[float], epss: Optional[float]) -> Optional[float]:
     if cvss is None or epss is None:
         return None
     return round((cvss / 10.0) * epss, 4)
 
-# --------------------------
+# -----------------------
 # Parse OSV results
-# --------------------------
+# -----------------------
 def _extract_fixed_versions(vuln: Dict[str, Any]) -> List[str]:
     fixed = set()
     for aff in vuln.get("affected", []):
@@ -213,24 +214,81 @@ def parse_osv_results(osv_json: Dict[str, Any]) -> Tuple[List[Dict[str, Any]], L
                     "cvss": cvss,
                     "epss": None,
                     "epss_percentile": None,
-                    "score": None,
+                    "s3d": 0.0,
+                    "score_weighted": None,
                     "score_alt": None,
                     "fixed": _extract_fixed_versions(v),
                 })
 
     return final_results, sorted(set(cve_ids))
 
-# --------------------------
-# Reporting
-# --------------------------
+# -----------------------
+# S3D Model 2 fetch
+# -----------------------
+def fetch_s3d_model2_metrics(deps: List[Dict[str, Any]]) -> Dict[str, Dict[str, float]]:
+    # Lazy import for FastAPI client
+    from google.cloud import bigquery
+    client = bigquery.Client()
+    metrics: Dict[str, Dict[str, float]] = {}
+    names = [d["package"] for d in deps]
+    versions = [d["version"] for d in deps]
+
+    # Query latest per name+version
+    query = """
+        WITH params AS (
+            SELECT name, version
+            FROM UNNEST(@names) AS name WITH OFFSET
+            JOIN UNNEST(@versions) AS version WITH OFFSET USING(OFFSET)
+        ),
+        ranked AS (
+            SELECT
+                t.dependency_name,
+                t.dependency_version,
+                relative_distribution_name AS relative_distribution,
+                percentile_rank_name AS percentile_rank,
+                relative_distribution_version AS relative_distribution_version,
+                percentile_rank_version AS percentile_rank_version,
+                run_date,
+                ROW_NUMBER() OVER (
+                    PARTITION BY t.dependency_name, t.dependency_version
+                    ORDER BY run_date DESC
+                ) AS rn
+            FROM `s3d_dura_data.s3d_model_2` t
+            JOIN params p
+            ON t.dependency_name = p.name AND t.dependency_version = p.version
+        )
+        SELECT *
+        FROM ranked
+        WHERE rn = 1
+    """
+    job = client.query(
+        query,
+        job_config=bigquery.QueryJobConfig(
+            query_parameters=[
+                bigquery.ArrayQueryParameter("names", "STRING", names),
+                bigquery.ArrayQueryParameter("versions", "STRING", versions)
+            ]
+        ),
+    )
+    for row in job:
+        key = f"{row['dependency_name']}@{row['dependency_version']}"
+        metrics[key] = {
+            "s3d": row.get("relative_distribution_version") or 0.0,
+            "s3d_percentile": row.get("percentile_rank_version") or 0.0
+        }
+    return metrics
+
+# -----------------------
+# Save reports
+# -----------------------
 def save_json_report(path: str, report: Dict[str, Any]) -> None:
     with open(path, "w") as f:
         json.dump(report, f, indent=2)
 
 def save_csv(results: List[Dict[str, Any]], path: str) -> None:
     fieldnames = [
-        "package", "version", "ecosystem", "id", "cves", "summary",
-        "cvss", "epss", "epss_percentile", "score", "score_alt", "fixed"
+        "package", "version", "ecosystem", "id", "aliases", "cves",
+        "summary", "cvss", "epss", "epss_percentile", "s3d", "score_weighted", "score_alt", "fixed"
     ]
     with open(path, "w", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
@@ -241,35 +299,39 @@ def save_csv(results: List[Dict[str, Any]], path: str) -> None:
                 "version": r.get("version", ""),
                 "ecosystem": r.get("ecosystem", ""),
                 "id": r.get("id", ""),
+                "aliases": ",".join(r.get("aliases", [])),
                 "cves": ",".join(r.get("cves", [])),
                 "summary": r.get("summary", ""),
                 "cvss": r.get("cvss"),
                 "epss": r.get("epss"),
                 "epss_percentile": r.get("epss_percentile"),
-                "score": r.get("score"),
+                "s3d": r.get("s3d"),
+                "score_weighted": r.get("score_weighted"),
                 "score_alt": r.get("score_alt"),
                 "fixed": ",".join(r.get("fixed", [])),
             })
 
-# --------------------------
+# -----------------------
 # Main
-# --------------------------
+# -----------------------
 def main():
-    parser = argparse.ArgumentParser(description="Scan SPDX SBOM with OSV + EPSS, export JSON/CSV with prioritization")
-    parser.add_argument("--sbom", required=True, help="Path to SPDX JSON SBOM (e.g., *.spdx.json)")
+    parser = argparse.ArgumentParser(description="S3D Vulnerability Scanner with OSV + EPSS + S3D")
+    parser.add_argument("--sbom", required=True, help="Path to SPDX JSON SBOM")
     parser.add_argument("--json", default="final_report.json", help="JSON report output path")
     parser.add_argument("--csv", nargs="?", const="final_report.csv", help="CSV report output path")
     parser.add_argument("--normalize", action="store_true", help="Normalize SBOM via SBOMLoader if available")
-    parser.add_argument("--top", type=int, default=0,
-                        help="Print top N vulnerabilities by prioritization score to stdout (quick triage)")
+    parser.add_argument("--top", type=int, default=0, help="Print top N vulnerabilities for quick triage")
+    parser.add_argument("--cvss-weight", type=float, default=0.75, help="Weight for CVSS (default=0.75)")
+    parser.add_argument("--epss-weight", type=float, default=0.25, help="Weight for EPSS (default=0.25)")
+    parser.add_argument("--s3d-weight", type=float, default=0.0, help="Weight for S3D (default=0.0)")
     args = parser.parse_args()
 
     sbom_path = args.sbom
 
-    # Optional normalization
+    # Optional SBOM normalization
     if args.normalize:
         SBOMLoader = try_import_sbom_loader()
-        if SBOMLoader is not None:
+        if SBOMLoader:
             loader = SBOMLoader(sbom_path).load()
             sbom_dict = loader.get_data()
             sbom_path = "sbom_clean.spdx.json"
@@ -277,12 +339,11 @@ def main():
                 json.dump(sbom_dict, f, indent=2)
             print(f"ℹ️  SBOM normalized to {sbom_path}")
 
-    # Automatic unwrap "sbom" key if present
+    # Automatic unwrap
     sbom_path = unwrap_sbom_if_needed(sbom_path)
 
     osv_results_path = "osv_results.json"
     code, so, se = run_osv_scan(sbom_path, osv_results_path)
-
     if code not in (0, 1):
         report = {
             "status": "error",
@@ -315,47 +376,53 @@ def main():
         if primary_cve and primary_cve in epss_map:
             r["epss"] = epss_map[primary_cve]["epss"]
             r["epss_percentile"] = epss_map[primary_cve]["percentile"]
-        else:
-            r["epss"] = None
-            r["epss_percentile"] = None
-        r["score"] = prioritization_score(r.get("cvss"), r.get("epss"))
+
+    # S3D Model 2 integration
+    s3d_metrics = fetch_s3d_model2_metrics(results)
+    for r in results:
+        key = f"{r['package']}@{r['version']}"
+        r["s3d"] = s3d_metrics.get(key, {}).get("s3d", 0.0)
+
+        # Weighted prioritization
+        r["score_weighted"] = compute_prioritization(
+            r.get("cvss"), r.get("epss"), r.get("s3d"),
+            args.cvss_weight, args.epss_weight, args.s3d_weight
+        )
         r["score_alt"] = prioritization_product(r.get("cvss"), r.get("epss"))
 
     results.sort(key=lambda x: (
-        x["score"] if x["score"] is not None else -1,
+        x["score_weighted"] if x["score_weighted"] is not None else -1,
         x["cvss"] if x["cvss"] is not None else -1,
         x["epss"] if x["epss"] is not None else -1,
     ), reverse=True)
 
-    # Quick triage printout
+    # Quick triage
     if args.top and results:
-        print(f"\n🔍 Top {args.top} vulnerabilities by prioritization score:")
+        print(f"\n🔍 Top {args.top} vulnerabilities by weighted score:")
         for i, r in enumerate(results[:args.top], start=1):
             print(f"{i}. {r['package']}@{r['version']} | ID: {r['id']} | "
                   f"CVSS: {r.get('cvss')} | EPSS: {r.get('epss')} | "
-                  f"Score: {r.get('score')} | Summary: {r.get('summary')[:80]}{'...' if len(r.get('summary',''))>80 else ''}")
+                  f"S3D: {r.get('s3d')} | Score: {r.get('score_weighted')} | "
+                  f"Summary: {r.get('summary')[:80]}{'...' if len(r.get('summary',''))>80 else ''}")
 
-    status = "ok" if results else "empty"
-    message = f"Found {len(results)} vulnerabilities" if results else "No vulnerabilities found in the scanned SBOM."
-
+    # Save reports
     report = {
-        "status": status,
+        "status": "ok" if results else "empty",
         "timestamp": utc_minus_4_iso(),
         "sbom_file": args.sbom,
         "sbom_used": sbom_path,
         "osv_scanner_version": get_osv_version(),
-        "details": {"message": message, "unique_cves": len(cve_ids)},
+        "details": {"message": f"Found {len(results)} vulnerabilities" if results else "No vulnerabilities found",
+                    "unique_cves": len(cve_ids)},
         "results": results
     }
-
     save_json_report(args.json, report)
     if args.csv:
         csv_path = args.csv if isinstance(args.csv, str) else "final_report.csv"
         save_csv(results, csv_path)
-
-    print(f"📄 JSON saved to {args.json}")
-    if args.csv:
         print(f"🧾 CSV saved to {csv_path}")
+    print(f"📄 JSON saved to {args.json}")
+
 
 if __name__ == "__main__":
     main()
